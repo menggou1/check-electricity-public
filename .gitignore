@@ -1,0 +1,25 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# ── 敏感配置（含学号／密码） ──
+config.ini
+
+# ── 生成的二进制 / 截图文件 ──
+*.png
+debug_screenshot.png
+error_screenshot.png
+
+# ── 操作系统产物 ──
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
+
+# ── IDE ──
+.idea/
+.vscode/
+*.code-workspace
