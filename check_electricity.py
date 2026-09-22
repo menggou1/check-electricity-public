@@ -3,8 +3,8 @@
 
 功能：
   1. 登录并查询当前剩余电量
-  2. 将结果追加写入 CSV（日期 | 剩余电量 | 消耗电量）
-  3. 绘制最近 N 条的耗电柱状图
+  2. 每天仅保留一条最新快照，并重算 CSV 派生数据
+  3. 绘制最近 N 个记录区间的净耗电柱状图
 
 敏感配置（学号/密码/宿舍信息）已抽离到 config.ini 中，
 请复制 config.example.ini 为 config.ini 并根据实际修改。
@@ -14,16 +14,18 @@ import configparser
 import re
 import sys
 import os
-from datetime import datetime, date
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+import tempfile
+import time
+from contextlib import contextmanager
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from playwright.sync_api import sync_playwright
 
 # ── 第三方库 ──
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  # 非交互后端，适用于无 GUI 服务器
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from matplotlib.ticker import MaxNLocator
 from matplotlib.font_manager import FontProperties
 import warnings
 warnings.filterwarnings("ignore", message="Glyph.*missing from font")
@@ -93,6 +95,12 @@ PLOT_RECORDS = _cfg.getint("system", "plot_records", fallback=30)
 
 # CSV 文件路径（与脚本同目录）
 CSV_PATH = os.path.join(_BASE, "electricity_record.csv")
+
+# CSV 的唯一正式格式。消耗电量和间隔天数均由“日期、更新时间、剩余电量”重算，
+# 不能作为手工维护的原始数据。
+RECORD_COLUMNS = ["日期", "更新时间", "剩余电量", "消耗电量", "间隔天数"]
+RAW_COLUMNS = ["日期", "更新时间", "剩余电量"]
+INVALID_RECORD_PATH = os.path.join(_BASE, "electricity_record.invalid.csv")
 
 # 柱状图输出路径
 CHART_PATH = os.path.join(_BASE, "electricity_chart.png")
@@ -267,50 +275,53 @@ def query_electricity():
                 print("  页面未显示电量，尝试通过 JS 选择房间...")
 
                 page.evaluate(
-                    """() => {
-                    const area = document.querySelector('#area');
+                    """({selector, text}) => {
+                    const area = document.querySelector(selector);
                     if (area) {
                         for (let opt of area.options) {
-                            if (opt.text.includes('乾园')) {
+                            if (opt.text.includes(text)) {
                                 area.value = opt.value;
                                 area.dispatchEvent(new Event('change', {bubbles: true}));
                                 break;
                             }
                         }
                     }
-                }"""
+                    }""",
+                    {"selector": "#area", "text": BUILDING_GROUP},
                 )
                 page.wait_for_timeout(3000)
 
                 page.evaluate(
-                    """() => {
-                    const build = document.querySelector('#build');
+                    """({selector, text}) => {
+                    const build = document.querySelector(selector);
                     if (build) {
                         for (let opt of build.options) {
-                            if (opt.text.includes('6')) {
+                            if (opt.text.includes(text)) {
                                 build.value = opt.value;
                                 build.dispatchEvent(new Event('change', {bubbles: true}));
                                 break;
                             }
                         }
                     }
-                }"""
+                    }""",
+                    {"selector": "#build", "text": BUILDING},
                 )
                 page.wait_for_timeout(3000)
 
                 page.evaluate(
-                    """() => {
-                    const room = document.querySelector('#room');
+                    """({selector, text}) => {
+                    const room = document.querySelector(selector);
                     if (room) {
                         for (let opt of room.options) {
-                            if (opt.text.includes('6309')) {
+                            if (opt.text.includes(text)) {
                                 room.value = opt.value;
                                 room.dispatchEvent(new Event('change', {bubbles: true}));
                                 break;
                             }
                         }
                     }
-                }"""
+                    }""",
+                    {"selector": "#room", "text": ROOM},
                 )
                 page.wait_for_timeout(3000)
 
@@ -364,236 +375,255 @@ def query_electricity():
 
 
 # ================== CSV 读写 ===================
-def load_records(csv_path):
-    """读取已有 CSV 记录，返回 DataFrame（空表则返回空 DataFrame）"""
-    if not os.path.exists(csv_path):
-        return pd.DataFrame(columns=["日期", "剩余电量", "消耗电量", "是否充值"])
+def empty_records():
+    """返回符合正式结构的空记录表。"""
+    return pd.DataFrame(columns=RECORD_COLUMNS)
+
+
+@contextmanager
+def record_file_lock(csv_path, timeout_seconds=15):
+    """在读取、清洗和写回期间持有跨进程文件锁，防止并发运行互相覆盖。"""
+    lock_path = f"{csv_path}.lock"
+    lock_file = open(lock_path, "a+b")
+    if os.path.getsize(lock_path) == 0:
+        lock_file.write(b"0")
+        lock_file.flush()
+
+    deadline = time.monotonic() + timeout_seconds
+    locked = False
     try:
-        df = pd.read_csv(csv_path, encoding="utf-8-sig")
-        # 统一列名
-        expected_cols = ["日期", "剩余电量", "消耗电量", "是否充值"]
-        if len(df.columns) == 3:
-            # 旧格式：无 是否充值 列
-            df.columns = ["日期", "剩余电量", "消耗电量"]
-            df["是否充值"] = 0
-        else:
-            df.columns = expected_cols[: len(df.columns)]
-            if "是否充值" not in df.columns:
-                df["是否充值"] = 0
-        # 日期列转 datetime
-        df["日期"] = pd.to_datetime(df["日期"], errors="coerce")
-        df["剩余电量"] = pd.to_numeric(df["剩余电量"], errors="coerce")
-        df["消耗电量"] = pd.to_numeric(df["消耗电量"], errors="coerce")
-        df["是否充值"] = pd.to_numeric(df["是否充值"], errors="coerce").fillna(0).astype(int)
-        return df
-    except Exception as e:
-        print(f"  [WARN] 读取 CSV 出错: {e}，将重新创建")
-        return pd.DataFrame(columns=["日期", "剩余电量", "消耗电量", "是否充值"])
+        while not locked:
+            try:
+                lock_file.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("记录文件正被另一个查询任务使用，请稍后重试")
+                time.sleep(0.2)
+        yield
+    finally:
+        if locked:
+            try:
+                lock_file.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        lock_file.close()
 
 
-def append_record(csv_path, df, today_str, remaining):
-    """追加或覆盖当天记录到 DataFrame，并写回 CSV"""
-    # 检查当天是否已有记录
-    today_dt = pd.to_datetime(today_str)
-    mask = df["日期"] == today_dt
-    if mask.any():
-        # 已有当天记录 → 覆盖
-        idx = df.index[mask][0]
-        old_consumption = df.loc[idx, "消耗电量"]
-        old_recharge = df.loc[idx, "是否充值"]
+def _parse_datetimes(values):
+    """逐项解析日期，兼容旧 CSV 中混合的日期和时间格式。"""
+    return values.map(
+        lambda value: pd.to_datetime(value, errors="coerce")
+        if str(value).strip()
+        else pd.NaT
+    )
 
-        # 重新计算消耗电量：用前一条剩余电量 - 本次剩余电量
-        if idx > 0:
-            prev_remaining = df.iloc[idx - 1]["剩余电量"]
-            if pd.notna(prev_remaining):
-                consumption = round(prev_remaining - remaining, 2)
-            else:
-                consumption = None
-        else:
-            consumption = None
 
-        df.loc[idx, "剩余电量"] = round(remaining, 2)
-        df.loc[idx, "消耗电量"] = consumption
+def _write_invalid_rows(raw, original, invalid_mask):
+    """隔离无法可靠入库的行，绝不为它们猜测日期。"""
+    if not invalid_mask.any():
+        return
 
-        # 充值检测逻辑
-        recharge = old_recharge  # 默认保持原值
-        if consumption is not None and pd.notna(consumption):
-            if consumption < 0:
-                # 消耗为负 → 发生了充值
-                recharge = 1
-            else:
-                # 消耗为正
-                # 如果旧值标记为充值(1)且旧消耗为负（说明之前是充值状态）
-                # 现在消耗变正 → 只是正常消耗，不改变充值变量
-                if not (old_recharge == 1 and pd.notna(old_consumption) and old_consumption < 0):
-                    recharge = 0
-        df.loc[idx, "是否充值"] = recharge
+    # 隔离文件保留原始文本，便于人工找回日期或读数；原因则依据解析后的数据生成。
+    invalid = original.loc[invalid_mask].copy()
+    invalid["原因"] = ""
+    invalid.loc[raw.loc[invalid_mask, "日期"].isna(), "原因"] += "日期无效或为空;"
+    invalid.loc[raw.loc[invalid_mask, "剩余电量"].isna(), "原因"] += "剩余电量无效或为空;"
+    invalid["隔离时间"] = datetime.now(ZoneInfo("Asia/Shanghai")).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    write_header = not os.path.exists(INVALID_RECORD_PATH)
+    invalid.to_csv(
+        INVALID_RECORD_PATH,
+        mode="a",
+        index=False,
+        encoding="utf-8-sig",
+        header=write_header,
+        na_rep="",
+    )
+    print(f"  [WARN] 已隔离 {len(invalid)} 条日期或剩余电量无效的记录: {INVALID_RECORD_PATH}")
 
-        print(f"\n  ✅ 已覆盖记录: {today_str}, 剩余 {remaining} 度", end="")
-        if consumption is not None:
-            print(f", 消耗 {consumption} 度", end="")
-        else:
-            print(" (首条记录，无消耗数据)", end="")
-        if recharge:
-            print(" [充值]")
-        else:
-            print()
+
+def recompute_derived_columns(df):
+    """按日期顺序重算所有派生列，确保每一段都基于前一有效快照。"""
+    if df.empty:
+        return empty_records()
+
+    result = df[RAW_COLUMNS].copy().sort_values("日期").reset_index(drop=True)
+    result["日期"] = pd.to_datetime(result["日期"], errors="raise").dt.normalize()
+    result["更新时间"] = pd.to_datetime(result["更新时间"], errors="raise")
+    result["剩余电量"] = result["剩余电量"].round(2)
+    result["消耗电量"] = (result["剩余电量"].shift(1) - result["剩余电量"]).round(2)
+    result["间隔天数"] = result["日期"].diff().dt.days.astype("Int64")
+    return result[RECORD_COLUMNS]
+
+
+def load_records(csv_path):
+    """读取、校验、清洗已有记录；无法识别的表结构会中止本次写入。"""
+    if not os.path.exists(csv_path):
+        return empty_records()
+    try:
+        source = pd.read_csv(csv_path, encoding="utf-8-sig", dtype=str, keep_default_na=False)
+    except pd.errors.EmptyDataError as exc:
+        raise ValueError("CSV 是空文件，已停止写入以防覆盖历史数据") from exc
+
+    source.columns = [str(column).strip() for column in source.columns]
+    columns = list(source.columns)
+    legacy_columns = ["日期", "剩余电量", "消耗电量"]
+    legacy_recharge_columns = ["日期", "剩余电量", "消耗电量", "是否充值"]
+    if columns == RECORD_COLUMNS:
+        raw = source[RAW_COLUMNS].copy()
+    elif columns == legacy_columns or columns == legacy_recharge_columns:
+        # 迁移旧格式：历史“是否充值”字段被有意丢弃，消耗电量会统一重算。
+        raw = source[["日期", "剩余电量"]].copy()
+        raw["更新时间"] = raw["日期"]
+        raw = raw[RAW_COLUMNS]
+        print("  [迁移] 已读取旧 CSV 格式，将移除充值字段并重算派生数据")
     else:
-        # 无当天记录 → 新增
-        if len(df) >= 1:
-            prev_remaining = df.iloc[-1]["剩余电量"]
-            if pd.notna(prev_remaining):
-                consumption = round(prev_remaining - remaining, 2)
-            else:
-                consumption = None
-        else:
-            consumption = None
-
-        # 充值检测：消耗为负就是充值
-        recharge = 1 if (consumption is not None and consumption < 0) else 0
-
-        new_row = pd.DataFrame(
-            [
-                {
-                    "日期": today_str,
-                    "剩余电量": round(remaining, 2),
-                    "消耗电量": consumption,
-                    "是否充值": recharge,
-                }
-            ]
+        raise ValueError(
+            f"CSV 列名不受支持: {columns!r}。请修复文件后再运行，原文件未被修改。"
         )
-        df = pd.concat([df, new_row], ignore_index=True)
-        print(f"\n  ✅ 已写入记录: {today_str}, 剩余 {remaining} 度", end="")
-        if consumption is not None:
-            print(f", 消耗 {consumption} 度", end="")
-        else:
-            print(" (首条记录，无消耗数据)", end="")
-        if recharge:
-            print(" [充值]")
-        else:
-            print()
 
-    # 写回 CSV（日期以短格式写入）
+    raw_text = raw.copy()
+    raw["日期"] = _parse_datetimes(raw["日期"]).dt.normalize()
+    raw["更新时间"] = _parse_datetimes(raw["更新时间"])
+    raw["更新时间"] = raw["更新时间"].where(raw["更新时间"].notna(), raw["日期"])
+    raw["剩余电量"] = pd.to_numeric(raw["剩余电量"], errors="coerce")
+
+    invalid_mask = raw["日期"].isna() | raw["剩余电量"].isna()
+    _write_invalid_rows(raw, raw_text, invalid_mask)
+    valid = raw.loc[~invalid_mask].copy()
+    if valid.empty:
+        return empty_records()
+
+    valid["_source_order"] = range(len(valid))
+    valid = valid.sort_values(["日期", "更新时间", "_source_order"])
+    duplicate_count = valid.duplicated("日期", keep="last").sum()
+    if duplicate_count:
+        print(f"  [清洗] 发现 {duplicate_count} 条重复日期记录，保留当天最后一次查询")
+        valid = valid.drop_duplicates("日期", keep="last")
+    return recompute_derived_columns(valid)
+
+
+def write_records_atomically(csv_path, df):
+    """先写临时文件，再原子替换正式 CSV，避免中断时产生半个文件。"""
     df_out = df.copy()
-    # 若日期列是 datetime 则转为短字符串 YYYY-MM-DD
-    if pd.api.types.is_datetime64_any_dtype(df_out["日期"]):
-        df_out["日期"] = df_out["日期"].dt.strftime("%Y-%m-%d")
-    # 消耗电量写入时若为 NaN 则为空，但保留列
-    df_out.to_csv(csv_path, index=False, encoding="utf-8-sig", float_format="%.2f", na_rep="")
-    # 确保内存中 df 的日期是 datetime 类型
-    df["日期"] = pd.to_datetime(df["日期"], errors="coerce")
-    return df
+    df_out["日期"] = df_out["日期"].dt.strftime("%Y-%m-%d")
+    df_out["更新时间"] = df_out["更新时间"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    directory = os.path.dirname(os.path.abspath(csv_path))
+    fd, temp_path = tempfile.mkstemp(prefix=".electricity_record_", suffix=".tmp", dir=directory)
+    os.close(fd)
+    try:
+        df_out.to_csv(temp_path, index=False, encoding="utf-8-sig", float_format="%.2f", na_rep="")
+        os.replace(temp_path, csv_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def upsert_daily_record(csv_path, df, record_day, queried_at, remaining):
+    """以日期为唯一键写入当天最新快照，并重算所有派生数据。"""
+    record_day = pd.Timestamp(record_day).normalize()
+    queried_at = pd.Timestamp(queried_at)
+    if queried_at.tzinfo is not None:
+        # CSV 统一保存中国本地钟表时间，不写入时区偏移，避免与旧记录混合成 object 列。
+        queried_at = queried_at.tz_localize(None)
+    existing_count = (df["日期"] == record_day).sum()
+    raw = df.loc[df["日期"] != record_day, RAW_COLUMNS].copy()
+    new_row = pd.DataFrame(
+        [{"日期": record_day, "更新时间": queried_at, "剩余电量": float(remaining)}]
+    )
+    result = recompute_derived_columns(pd.concat([raw, new_row], ignore_index=True))
+    write_records_atomically(csv_path, result)
+
+    current = result.loc[result["日期"] == record_day].iloc[0]
+    action = "已覆盖" if existing_count else "已写入"
+    print(f"\n  ✅ {action}记录: {record_day:%Y-%m-%d}, 剩余 {current['剩余电量']:.2f} 度", end="")
+    if pd.notna(current["消耗电量"]):
+        print(f", 相对上次净耗电 {current['消耗电量']:.2f} 度（间隔 {current['间隔天数']} 天）")
+    else:
+        print("（首条记录，无比较数据）")
+    return result
 
 
 # ================== 柱状图绘制 ===================
 def plot_consumption(df, chart_path):
     """
-    绘制耗电柱状图，跳过充值当天（第零条）。
+    绘制各相邻快照之间的净耗电柱状图。
+
     逻辑：
-      - 丢弃消耗电量为空的行（首条无消耗）
-      - 从最近一次充值之后的下一条开始绘图
-      - 如果最近一次充值在当天 → 无法绘图
-      - 如果充值之后数据很多 → 仍然只绘制最近 PLOT_RECORDS 条
+      - 首条记录只有基线，没有柱；其余每条记录对应一个完整区间
+      - 正数表示余额减少，负数表示余额增加；本程序不对余额增加原因作判断
+      - 数据超过 PLOT_RECORDS 时，绘制最近的完整区间
     """
-    # 丢弃消耗电量为空的行
     valid = df.dropna(subset=["消耗电量"]).copy()
     if len(valid) < 1:
         print("  [SKIP] 不足 2 条有效记录，跳过绘图")
         return
 
-    # 找到最近一次充值的位置（是否充值 == 1）
-    recharge_mask = valid["是否充值"] == 1
-    if recharge_mask.any():
-        last_recharge_idx = valid[recharge_mask].index[-1]  # valid 中的原始索引
-        last_recharge_pos = valid.index.get_loc(last_recharge_idx)  # 在 valid 中的位置
-
-        # 如果最近一次充值就在 valid 的最后一条（包含今天）
-        if last_recharge_pos == len(valid) - 1:
-            print("  [SKIP] 最近一次充值为当天记录，无法绘图")
-            return
-
-        # 从充值之后的下一条开始
-        plot_data = valid.iloc[last_recharge_pos + 1:].reset_index(drop=True)
-        print(f"  [充值] 最近充值位置: {valid.iloc[last_recharge_pos]['日期'].strftime('%Y-%m-%d')}，从其后开始绘图")
-    else:
-        # 没有充值记录，从第1条开始（第0条作为基线）
-        if len(valid) < 2:
-            print("  [SKIP] 无充值记录且不足 2 条有效数据，跳过绘图")
-            return
-        plot_data = valid.iloc[1:].reset_index(drop=True)
-        print("  [充值] 无充值记录")
-
     # 如果数据过多，取最近 PLOT_RECORDS 条
-    if len(plot_data) > PLOT_RECORDS:
-        plot_data = plot_data.tail(PLOT_RECORDS).reset_index(drop=True)
+    if len(valid) > PLOT_RECORDS:
+        valid = valid.tail(PLOT_RECORDS).reset_index(drop=True)
         print(f"  [绘图] 数据较多，取最近 {PLOT_RECORDS} 条")
 
+    plot_data = valid.reset_index(drop=True)
     n = len(plot_data)
-    if n < 1:
-        print("  [SKIP] 无足够数据绘图")
-        return
     print(f"  [绘图] 使用 {n} 条记录绘制柱状图")
 
     # ── 构建图表 ──
     fig, ax = plt.subplots(figsize=(max(14, n * 0.7), 6))
 
-    # 柱状图：X 轴是记录索引，Y 轴是消耗电量
+    # 柱状图：每根柱代表从上一条记录到当前记录的完整区间。
     x = range(n)
     values = plot_data["消耗电量"].values
+    colors = ["#4A90D9" if value >= 0 else "#D97706" for value in values]
 
-    bars = ax.bar(
+    ax.bar(
         x,
         values,
         width=0.6,
-        color="#4A90D9",
+        color=colors,
         edgecolor="#2C5F8A",
         linewidth=0.8,
         alpha=0.85,
     )
 
-    # 在每个柱上方标注数值
+    # 在柱的外侧标注数值，正负值分别放在柱顶和柱底。
+    offset = max(float(max(abs(values))) * 0.02, 0.05)
     for i, v in enumerate(values):
         if pd.notna(v):
             ax.text(
                 i,
-                v + (max(values) * 0.02 if max(values) > 0 else 0.5),
+                v + offset if v >= 0 else v - offset,
                 f"{v:.2f}",
                 ha="center",
-                va="bottom",
+                va="bottom" if v >= 0 else "top",
                 fontsize=7,
                 fontweight="bold",
             )
 
-    # ── X 轴标签：当前日期 + 间隔天数 ──
-    def fmt(d):
-        if pd.isna(d):
-            return "?"
-        if isinstance(d, pd.Timestamp):
-            return d.strftime("%Y-%m-%d")
-        return str(d)
-
+    # ── X 轴标签：区间终点日期 + 与前一次记录的间隔 ──
     labels = []
     for i in range(n):
         curr_date = plot_data.iloc[i]["日期"]
-        curr_str = fmt(curr_date)
-
-        # 在原始 df 中的位置
-        same_day_mask = df["日期"] == curr_date
-        if same_day_mask.any():
-            pos_in_df = same_day_mask.idxmax() + same_day_mask.sum() - 1
-        else:
-            pos_in_df = df["日期"].searchsorted(curr_date, side="left")
-
-        if pos_in_df > 0:
-            prev_date = df.iloc[pos_in_df - 1]["日期"]
-            if isinstance(curr_date, pd.Timestamp) and isinstance(prev_date, pd.Timestamp):
-                days_diff = (curr_date - prev_date).days
-                label = f"{curr_str}\n{days_diff}天"
-            else:
-                label = curr_str
-        else:
-            label = curr_str
-        labels.append(label)
+        days_diff = int(plot_data.iloc[i]["间隔天数"])
+        labels.append(f"{curr_date:%Y-%m-%d}\n距上次 {days_diff} 天")
 
     # ── X 轴标签旋转防重叠 ──
     ax.set_xticks(x)
@@ -602,20 +632,17 @@ def plot_consumption(df, chart_path):
     # ── 标题和轴标签 ──
     first_date = plot_data.iloc[0]["日期"]
     last_date = plot_data.iloc[-1]["日期"]
-    fs = fmt(first_date) if not pd.isna(first_date) else "?"
-    ls = fmt(last_date) if not pd.isna(last_date) else "?"
-    date_range_str = f"{fs} ~ {ls}"
+    date_range_str = f"{first_date:%Y-%m-%d} ~ {last_date:%Y-%m-%d}"
     ax.set_title(
-        f"{BUILDING_GROUP} {BUILDING} {ROOM} 耗电图（{date_range_str}）",
+        f"{BUILDING_GROUP} {BUILDING} {ROOM} 区间净耗电图（{date_range_str}）",
         fontsize=13,
         fontweight="bold",
         pad=12,
     )
-    ax.set_ylabel("消耗电量（度）", fontsize=10)
-    ax.set_xlabel("日期间隔", fontsize=10)
+    ax.set_ylabel("区间净耗电（度；负值表示余额增加）", fontsize=10)
+    ax.set_xlabel("记录日期", fontsize=10)
 
-    # Y 轴从 0 开始
-    ax.set_ylim(bottom=0)
+    ax.axhline(0, color="#555555", linewidth=0.8)
 
     # 网格线
     ax.yaxis.grid(True, linestyle="--", alpha=0.3)
@@ -633,8 +660,9 @@ def main():
     print("=" * 55)
     print("  河南科技大学宿舍电量查询 & 记录系统")
     print(f"  {BUILDING_GROUP} {BUILDING} {ROOM}")
-    today_str = date.today().strftime("%Y-%m-%d")
-    print(f"  查询日期: {today_str}")
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    today = now.date()
+    print(f"  查询日期: {today:%Y-%m-%d}（Asia/Shanghai）")
     print("=" * 55)
 
     # 1. 查询电量
@@ -643,14 +671,18 @@ def main():
         print("\n❌ 查询电量失败，程序退出")
         sys.exit(1)
 
-    # 2. 加载已有记录
+    # 2. 加载、清洗、去重并写入当天唯一快照。锁覆盖整个读改写过程。
     print("\n" + "-" * 45)
     print("  记录处理:")
-    df = load_records(CSV_PATH)
-    print(f"  已有记录数: {len(df)}")
-
-    # 3. 追加新记录
-    df = append_record(CSV_PATH, df, today_str, remaining)
+    try:
+        with record_file_lock(CSV_PATH):
+            df = load_records(CSV_PATH)
+            print(f"  清洗后记录数: {len(df)}")
+            queried_at = datetime.now(ZoneInfo("Asia/Shanghai"))
+            df = upsert_daily_record(CSV_PATH, df, today, queried_at, remaining)
+    except (OSError, TimeoutError, ValueError) as exc:
+        print(f"\n❌ 记录处理失败，未写入 CSV：{exc}")
+        sys.exit(1)
 
     # 4. 绘图
     print("\n" + "-" * 45)
